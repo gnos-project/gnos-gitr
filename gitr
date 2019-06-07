@@ -1,0 +1,1067 @@
+#!/bin/bash
+# NAME:  GNOS gitr
+# DESC:  GIT repository initializer
+# AUTH:  elias@gnos.in
+# FEAT:  Multiple SSH keys
+# FEAT:  Multiple GIT remotes
+# FEAT:  Pluggable backend architecture
+# FEAT:  Bitbucket, Github, Gitlab, Keybase
+# FEAT:  Uniform Git Location specification
+# FEAT:  TOR/SOCKS proxy support
+# DEPS:  jq socat curl ssh
+# DEPS:  keybase # TODO gitlab-cli
+
+
+########
+# FUNC #  System
+########
+
+
+Usage() # $1:RET
+{
+    cat <<EOF
+# USAGE: $( basename "$BASH_SOURCE" ) [OPTIONS] REPO [BRANCH]
+
+# OPTIONS: Repository configuration
+  --name       "My git NAME"
+  --email      my_git@EMAIL.com
+
+# OPTIONS: Network configuration
+  --key        PATH, repeat for multiple ssh keys
+  --tor        PORT, local SOCKS listening TCP port
+  --socks      HOST:PORT, SOCKS proxy
+
+# OPTIONS: Pluggable remotes
+  --keybase    user/repo[%teamid][@branch]
+  --github     user/repo[%public][@branch]
+  --gitlab     [git@my-gitlab.com[:22]:]user/repo[@branch]
+  --bitbucket  [git@bitbucket.biz[:22]:]user/repo[%teamid][@branch]
+  --ssh        user@my-server.org[:222]:path/repo[@branch]
+
+# DOCUMENTATION:
+  - UGL spec:  user@host[:22]:path/repo[%scope][@branch]
+  - @branch is tracked only for the first remote
+  - if all branches are aligned, will create a convenient 'all' remote
+
+|  BACKEND  |       CREATION       |    Supported SCOPES   | KEY | TOR |
+|===========|======================|=======================|=====|=====|
+| ssh       | `ssh git init`       | private               | yes | yes |
+| gitlab    | `git push`           | private               | yes | yes |
+| github    | API prompts password | private,public        | yes | yes |
+| bitbucket | API prompts password | private,public,TEAMID | yes | yes |
+| keybase   | CLI may call GUI     | private,TEAMID        | no  | no  |
+
+EOF
+    exit $1
+}
+
+
+# Logs
+Log() # $*:MSG
+{
+    echo -ne "\e[0;33m"
+    echo "LOG: $*" >&2
+    echo -ne "\e[0m"
+}
+
+Cmd() # $*:CMD
+{
+    if [[ -z $DEBUG && -z $DRY ]] ; then
+        "$@"
+    elif [[ -n $DEBUG && -z $DRY ]] ; then
+        Dbg COMMAND "$@"
+        "$@"
+    else
+        Dbg COMMAND "$@"
+    fi
+}
+
+Dbg() # $*:MSG
+{
+    [[ -z $DEBUG ]] && return
+    echo -ne "\e[0;34m"
+    echo "DBG: $*" >&2
+    echo -ne "\e[0m"
+}
+
+Die() # $*:MSG
+{
+    echo -ne "\e[1;31m"
+    echo "ERR: $*" >&2
+    echo -ne "\e[0m"
+    exit 1
+}
+
+
+# Traps
+declare -a TRAPS
+declare TRAP_REGISTERED
+
+PushTrap() # $*:CMD
+{
+    RegisterTrap
+    TRAPS+=( "$*" )
+}
+
+PopTrap() # NOARGS
+{
+    unset 'TRAPS[${#TRAPS[@]}-1]'
+}
+
+RegisterTrap() # NOARGS
+{
+    [[ $TRAP_REGISTERED == 1 ]] && return
+    trap "ExitTrap" INT TERM EXIT QUIT
+    TRAP_REGISTERED=1
+}
+
+ExitTrap() # NOARGS
+{
+    Log "Exiting..."
+    for (( i=${#TRAPS[@]}-1;i>=0;i-- )); do
+        eval "${TRAPS[i]}"
+    done
+}
+
+
+
+########
+# FUNC #  Networking
+########
+
+
+ValidateEmail() # $1:EMAIL
+{
+      regex="^([A-Za-z]+[A-Za-z0-9]*((\.|\-|\_)?[A-Za-z]+[A-Za-z0-9]*){1,})@(([A-Za-z]+[A-Za-z0-9]*)+((\.|\-|\_)?([A-Za-z]+[A-Za-z0-9]*)+){1,})+\.([A-Za-z]{2,})+"
+      [[ "${1}" =~ $regex ]]
+}
+
+ValidateTcp() # $1:PORT
+{
+    [[ $1 =~ ^[0-9]{1,5}$ ]] || return 1
+    [[ $1 -lt 65535 ]]
+}
+
+CheckHttpCode() # $1:URL
+{
+    local code=$( curl -L ${SOCKS_PORT+--proxy socks4a://$SOCKS_HOST:$SOCKS_PORT} -s -o /dev/null -w "%{http_code}" "$1" )
+    [[ $code == "200" ]]
+}
+
+CheckTor() # $1:PORT
+{
+    local buf=$( curl --proxy socks4a://127.0.0.1:$1 -s "https://check.torproject.org/" )
+    [[ $buf =~ 'Congratulations' ]]
+}
+
+CheckSshAuth() # $1:USER $2:HOST $3:PORT
+{
+    Log "Checking SSH auth to '$1@$2:$port'"
+    ssh -F /dev/null -o ControlMaster=no \
+        ${SSH_IDS[@]+ -o IdentitiesOnly=yes "${SSH_IDS[@]}" } \
+        ${SOCKS_PORT+ -o ProxyCommand="socat - SOCKS4A:$SOCKS_HOST:%h:%p,socksport=$SOCKS_PORT" -o VerifyHostKeyDNS=no} \
+        -o StrictHostKeyChecking=no -o PasswordAuthentication=no \
+        -T -p "$3" "$1@$2" exit 2>&1
+# TOCHECK LocalCommand RemoteCommand
+}
+
+CheckSshPort() # $1:HOST $2:PORT
+{
+    local buf
+    if [[ -n $SOCKS_PORT ]] ; then
+        buf=$( socat - SOCKS4A:$SOCKS_HOST:"$1":"$2",readbytes=3,socksport=$SOCKS_PORT  )
+    else
+        buf=$( socat - tcp:"$1":"$2",readbytes=3 2>/dev/null </dev/null )
+    fi
+    [[ $buf == "SSH" ]]
+}
+
+CreateSshKeys() # $*:KEY_PATH
+{
+    for sshKey in "$@" ; do
+
+        if [[ -n $sshKey && ! -f $sshKey ]] ; then
+            Log "Generating SSH private key '$sshKey'"
+
+               Cmd mkdir -p "$( dirname "$sshKey" )" \
+            || "Failed creating KEY directory '$$( dirname "$sshKey" )'"
+
+               Cmd ssh-keygen -t rsa -b 4096 -C "$GIT_EMAIL" -f "$sshKey" \
+            || Die "Failed generating SSH key '$sshKey'"
+
+            Cmd chmod 600 "$sshKey"
+
+            Log "Generated SSH public key '$sshKey.pub'"
+            cat "$sshKey.pub" 2>/dev/null
+        fi
+
+        [[ -n $sshKey ]] && SSH_IDS+=( "-o" "IdentityFile=\"$sshKey\"" )
+    
+    done
+}
+
+
+
+########
+# FUNC #  Upstream data structure
+########
+
+
+ParseRemoteData() # $1:TYPE $2:SPEC
+{
+    local type=$1
+    local spec=$2
+
+    if [[ $spec =~ : ]]; then
+        local sshUserHostPort=${spec%:*}
+        local sshUserHost=${sshUserHostPort%:*}
+
+        if [[ $sshUserHostPort =~ : ]] ; then
+            local port=${sshUserHostPort##*:}
+        else
+            local port=22
+        fi
+        local user=${sshUserHost%@*}
+        local host=${sshUserHost##*@}
+
+        [[ -n $host && -z $port ]] && port=22
+
+        local repPathNameScopBran=${spec##*:}
+    else
+        local port=22
+        local user=
+        local host=
+
+        local repPathNameScopBran=${spec}
+    fi
+    if [[ $repPathNameScopBran =~ @ ]]; then
+        local repPathNameScop=${repPathNameScopBran%@*}
+        local branch=${repPathNameScopBran##*@}
+    else
+        local repPathNameScop=${repPathNameScopBran}
+        local branch=
+    fi
+
+    local repNameScop=${repPathNameScop##*/}
+
+    if [[ $repNameScop =~ % ]]; then
+        local name=${repNameScop%\%*}
+        local scope=${repNameScop##*%}
+        [[ -z $scope ]] && scope=public
+    else
+        local name=${repNameScop}
+        local scope=
+    fi
+    local path=${repPathNameScop%/*}
+
+
+    # Defaults
+    while [[ $name =~ \.git$ ]] ; do name="${name%.git}" ; done
+    local label="upstream${#REMOTES[@]}"
+
+
+    # Checks
+
+    ValidateTcp "$port" || Die "Invalid SSH port '$port' in spec '$spec'"
+
+    if [[ -n $host ]] ; then
+        CheckSshPort "$host" $port || Die "Unreachable SSH endpoint '$host:$port' in spec '$spec'"
+    fi
+
+    if [[ -n $user ]] ; then
+        [[ $user =~ ^[[:alnum:].-_]+$ ]] || Die "Invalid SSH user '$user' in spec '$spec'"
+    fi
+
+    if [[ -n $branch ]] ; then
+        ValidateRef "$branch" || Die "Invalid GIT branch name '$BRANCH' in spec '$spec'"
+    fi
+
+
+    SaveRemoteData ${#REMOTES[@]}
+}
+
+
+SaveRemoteData() # $1:ID
+{
+    local serializedSpec
+    IFS='' read -r -d '' serializedSpec <<EOF
+{
+"id":     "$id",
+"type":   "$type",
+"spec":   "$spec",
+"host":   "$host",
+"port":   "$port",
+"user":   "$user",
+"path":   "$path",
+"name":   "$name",
+"scope":  "$scope",
+"label":  "$label",
+"branch": "$branch",
+"url":    "$url"
+}
+EOF
+
+    REMOTES[$1]="$serializedSpec"
+}
+
+
+# ALIAS LoadRemoteData # NOARGS
+IFS='' read -r -d '' UNSERIALIZE_SPEC <<'EOF'
+[[ ! $1 =~ ^[0-9]+$ ]] && Die "Internal error: LoadRemoteData requires ID as \$1"
+local type=$(   jq -r .type   <<<"${REMOTES[$1]}" )
+local spec=$(   jq -r .spec   <<<"${REMOTES[$1]}" )
+local host=$(   jq -r .host   <<<"${REMOTES[$1]}" )
+local port=$(   jq -r .port   <<<"${REMOTES[$1]}" )
+local user=$(   jq -r .user   <<<"${REMOTES[$1]}" )
+local path=$(   jq -r .path   <<<"${REMOTES[$1]}" )
+local name=$(   jq -r .name   <<<"${REMOTES[$1]}" )
+local scope=$(  jq -r .scope  <<<"${REMOTES[$1]}" )
+local label=$(  jq -r .label  <<<"${REMOTES[$1]}" )
+local branch=$( jq -r .branch <<<"${REMOTES[$1]}" )
+local url=$(    jq -r .url    <<<"${REMOTES[$1]}" )
+EOF
+shopt -s expand_aliases
+alias "LoadRemoteData=$UNSERIALIZE_SPEC"
+
+
+MapRemoteData() # $1:SUFFIX
+{
+    for ((i = 0 ; i < ${#REMOTES[@]} ; i++)); do
+        local type=$( jq -r .type <<<"${REMOTES[$i]}" )
+        "${type^}$1" $i
+    done
+}
+
+
+DebugRemoteData() # NOARGS
+{
+    Dbg "DEBUG=$DEBUG"
+    Dbg "TARGET=$TARGET"
+    Dbg "BRANCH=$BRANCH"
+    Dbg "ALIGNED=$ALIGNED"
+    Dbg "GIT_NAME=$GIT_NAME"
+    Dbg "GIT_EMAIL=$GIT_EMAIL"
+    Dbg "SSH_KEYS=${SSH_KEYS[@]}"
+    Dbg "SSH_IDS=${SSH_IDS[@]}"
+    Dbg "SOCKS_HOST=$SOCKS_HOST"
+    Dbg "SOCKS_PORT=$SOCKS_PORT"
+
+    for spec in "${REMOTES[@]}" ; do
+        Dbg "REMOTE $((cnt++))" "$( jq -C . <<<"$spec" )"
+    done
+}
+
+
+
+########
+# FUNC #  Git
+########
+
+
+ValidateRef() # $1:REF
+{
+    git check-ref-format --allow-onelevel "$1" &>/dev/null
+}
+
+
+ConfigureAlias() # NOARGS
+{
+    Cmd git config --replace-all push.default upstream
+
+    Log "Configuring alias 'pa' (push to all remotes)"
+    if [[ $ALIGNED -eq 0 ]] ; then
+
+        local buf="set -x ;"
+        for ((i = 0 ; i < ${#REMOTES[@]} ; i++)); do
+            local label=$( jq -r .label <<<"${REMOTES[$i]}" )
+            local branch=$( jq -r .branch <<<"${REMOTES[$i]}" )
+            [[ -z $branch ]] && branch=$BRANCH
+            buf="${buf} git push $label $BRANCH:$branch ;"
+        done
+        Cmd git config --replace-all alias.pa "!f(){ $buf };f"
+    else
+        Cmd git config --replace-all alias.pa "push all"
+    fi
+}
+
+
+ConfigureRemote() # $1:ID
+{
+    LoadRemoteData
+
+    [[ -z $branch ]] && branch=$BRANCH
+
+    Log "Configuring remote '$label'"
+    local remoteUrl=$( git remote get-url "$label" 2>/dev/null )
+    if [[ -n $remoteUrl && "$remoteUrl" != "$url" ]] ; then
+        Dbg "Removing remote '$label'"
+        Cmd git remote remove "$label" || Die "Failed removing remote '$label'"
+    fi
+    Cmd git config --replace-all "remote.$label.url" "$url"
+    Cmd git config --replace-all "remote.$label.fetch" "+refs/heads/*:refs/remotes/$label/*"
+
+    if [[ $ALIGNED -eq 1 ]] ; then
+
+        Log "Configuring remote 'all'"
+        if [[ $1 -eq 0 ]] ; then
+            if git remote get-url "all" &>/dev/null; then
+                Cmd git remote remove "all" || Die "Failed removing remote 'all'"
+            fi
+            Cmd git remote add "all" "$url" || Die "Failed adding remote 'all'"
+        fi
+        Cmd git remote set-url --add --push all "$url" || Die "Failed configuring remote 'all'"
+
+        if [[ $1 -eq 0 ]] ; then
+            Log "Configuring branch '$BRANCH' to remote 'all'"
+            Cmd git config --replace-all branch.$BRANCH.remote "all"
+        fi
+
+    else
+
+        if [[ $1 -eq 0 ]] ; then
+            Log "Configuring branch '$BRANCH' to remote '$label'"
+            Cmd git config --replace-all branch.$BRANCH.remote "$label"
+        fi
+
+    fi
+
+    if [[ $1 -eq 0 ]] ; then
+        Cmd git config --replace-all branch.$BRANCH.merge "refs/heads/$branch"
+        # DEV: ref as seen on *remote*
+    fi
+
+}
+
+
+
+########
+# FUNC #  Local
+########
+
+
+LocalCheck() # NOARGS
+{
+    # Check branches alignment
+    for spec in "${REMOTES[@]}" ; do
+        local remoteBranch=$( jq -r .branch <<<"$spec" )
+        if [[ -n $remoteBranch && $remoteBranch != $BRANCH ]] ; then
+            ALIGNED=0
+            break
+        fi
+    done
+}
+
+
+LocalCreate() # NOARGS
+{
+    # Create local directory
+    if [[ -e $TARGET && ! -d $TARGET ]] ; then
+        Die "File already exists '$TARGET'"
+    fi
+    if [[ ! -d $TARGET/ ]] ; then
+        Log "Creating directory '$TARGET'"
+        Cmd mkdir -p "$TARGET" || Die "Failed creating target directory '$TARGET'"
+    fi
+
+    pushd "$TARGET" &>/dev/null
+
+    # Create local repo
+    if git rev-parse --is-inside-work-tree &>/dev/null ; then
+        local top=$( git rev-parse --show-toplevel )
+        if [[ -z $DRY && $top != $TARGET ]] ; then
+            Die "Target '$TARGET' is nested in '$top' GIT repo"
+        fi
+    else
+        Log "Initializing local repository '$TARGET'"
+        Cmd git init || Die "Failed initializing GIT repo '$TARGET'"
+    fi
+
+    # Configure local repo
+    Log "Configuring local repository '$TARGET'"
+    Cmd git config user.name "$GIT_NAME"
+    Cmd git config user.email "$GIT_EMAIL"
+
+    # Configure networking
+    local sshIdentities # Hard-quoted version of $SSH_IDS[@]
+    if [[ ${#SSH_KEYS[@]} -gt 0 ]]; then
+        sshIdentities=" -o IdentitiesOnly=yes"
+        for sshKey in "${SSH_KEYS[@]}" ; do
+            sshIdentities="$sshIdentities -o IdentityFile=\"$sshKey\""
+        done
+    fi
+    local sshCommand="ssh -F /dev/null -o ControlMaster=no$sshIdentities${SOCKS_PORT+ -o ProxyCommand='socat - SOCKS4A:$SOCKS_HOST:%h:%p,socksport=$SOCKS_PORT' -o VerifyHostKeyDNS=no}"
+
+       Cmd git config core.sshCommand "$sshCommand" \
+    || Die "Failed configuring GIT ssh command '$sshCommand'"
+
+    if [[ -n $SOCKS_PORT ]] ; then
+       Cmd git config http.proxy "socks4a://$SOCKS_HOST:$SOCKS_PORT" \
+    || Die "Failed configuring GIT socks proxy"
+    fi
+
+    # Commit to master branch
+    if ! git rev-parse --verify "$BRANCH" &>/dev/null ; then
+        Log "Creating 'master' branch"
+           Cmd git commit --allow-empty -m "$EMPTY_COMMIT_MSG" \
+        || Die "Failed commit'"
+    fi
+
+    # Branch
+    if [[ $BRANCH != 'master ' ]] && ! git rev-parse --verify "$BRANCH" &>/dev/null ; then
+        Log "Creating '$BRANCH' branch"
+           Cmd git branch "$BRANCH" \
+        || Die "Failed commit"
+           Cmd git checkout "$BRANCH" \
+        || Die "Failed checkout '$BRANCH'"
+        # TODO
+    fi
+
+    popd &>/dev/null
+}
+
+
+
+########
+# FUNC #  Plugins: *Check
+########
+
+
+SshCheck() # $1:ID
+{
+    LoadRemoteData
+
+    [[ -n "$host" ]]  || Die "Missing hostname in SSH spec '$spec'"
+    [[ -n "$user" ]]  || Die "Missing username in SSH spec '$spec'"
+
+    # Validate SSH scope
+    [[ -z "$scope" ]] || Die "Unsupported scope '%' in SSH spec '$spec'"
+
+    # SSH label
+    local labelName="_$name"
+    [[ $name == "$( basename "$TARGET" )" ]] && labelName=
+    local label="$host$labelName"
+
+    # SSH url
+    if [[ ${path:0:1} != / && $port != 22 ]] ; then
+        Die "GIT supports either relative-PATH, or alternative-PORT, not both :("
+    elif [[ ${path:0:1} != / ]] ; then
+        # URL has relative path
+        url="$user@$host:$path/$name.git"
+    else
+        # URL has alternative port
+        url="ssh://$user@$host:$port:$path/$name.git"
+    fi
+
+    # Check SSH connection
+    CheckSshAuth "$user" "$host" "$port" || Die "Failed SSH connection '$user@$host:$port'"
+
+    SaveRemoteData $1
+}
+
+
+GithubCheck() # $1:ID
+{
+    LoadRemoteData
+
+    [[ -z "$host$user" ]] || Die "Invalid Github spec '$spec'"
+
+    # Validate Github username: $path
+    [[ ! $path =~ ^[[:alnum:]][[:alnum:]-]{0,38}+$ || $path =~ -- || $path =~ -$ ]] \
+    && Die "Invalid Github user '$path' in spec '$spec'"
+
+    # TODO Validate Github repo $name
+
+    # Validate Github scope
+       [[ -n $scope && $scope != 'private' && $scope != 'public' ]] \
+    && Die "Unsupported scope '%$scope' in Github spec '$spec'"
+
+    # Github url
+    local url="git@github.com:$path/$name.git"
+
+    # Github label
+    local labelName="/$name"
+    [[ $name == "$( basename "$TARGET" )" ]] && labelName=
+    local label="gh_$path$labelName"
+
+    # Check Github username
+    CheckHttpCode "https://github.com/$path" || Die "Unknown Github user '$path' in spec '$spec'"
+
+
+    # Check Github SSH connection
+    #    CheckSshAuth git github.com 22 \
+    # || Die "Failed connecting to Github: $buf"
+    local ret buf="$( ssh -F /dev/null -o ControlMaster=no \
+        ${SSH_IDS[@]+ -o IdentitiesOnly=yes "${SSH_IDS[@]}" } \
+        ${SOCKS_PORT+ -o ProxyCommand="socat - SOCKS4A:$SOCKS_HOST:%h:%p,socksport=$SOCKS_PORT" -o VerifyHostKeyDNS=no} \
+        -T git@github.com 2>&1 )"
+    ret=$?
+    [[ $ret -eq 0 && $buf =~ successfully ]] || Die "Failed connecting to Github: $buf"
+
+    SaveRemoteData $1
+}
+
+
+GitlabCheck() # $1:ID
+{
+    LoadRemoteData
+
+    [[ -z "$user" ]] || Die "Invalid Gitlab user '$user' in spec '$spec'"
+    
+    # TODO Validate Gitlab username $path
+
+    # TODO Validate Gitlab repo $name
+    
+    # Validate Gitlab $scope
+       # [[ -n $scope && $scope != 'private' && $scope != 'public' && $scope != 'internal' ]] \
+       [[ -n $scope && $scope != 'private' ]] \
+    && Die "Unsupported scope '%$scope' in Github spec '$spec'"
+    
+    # Gitlab url label
+    local labelName="/$name"
+    [[ $name == "$( basename "$TARGET" )" ]] && labelName=
+    if [[ -z $host ]] ; then
+        host='gitlab.com'
+        user='git'
+        url="$user@$host:$path/$name.git"
+        label="gl_$path$labelName"
+    else
+        label="gl_${host}_$path$labelName"
+    fi
+
+    # Check Gitlab username
+    CheckHttpCode "https://$host/$path" || Die "Unknown Gitlab namespace '$path' in spec '$spec'"
+
+    # Check Github SSH connection
+    local ret buf="$( ssh -F /dev/null -o ControlMaster=no \
+        ${SSH_IDS[@]+ -o IdentitiesOnly=yes "${SSH_IDS[@]}" } \
+        ${SOCKS_PORT+ -o ProxyCommand="socat - SOCKS4A:$SOCKS_HOST:%h:%p,socksport=$SOCKS_PORT" -o VerifyHostKeyDNS=no} \
+        -T -p $port $user@$host 2>&1 )"
+
+       [[ $buf =~ Welcome ]] \
+    || Die "Failed connecting to Gitlab: $buf"
+
+    SaveRemoteData $1
+}
+
+
+BitbucketCheck() # $1:ID
+{
+    LoadRemoteData
+
+    [[ -z "$user" ]] || Die "Invalid Bitbucket user '$user' in spec '$spec'"
+    
+    # TODO Validate Bitbucket username: $path
+
+    # TODO Validate Bitbucket repo $name
+
+    # Validate Bitbucket $scope
+    local bbName=$scope
+    if [[ $scope != 'public' && $scope != 'private' ]] ; then
+        bbName=$path
+        # TODO Validate Bitbucket team name
+    fi
+    
+    # Bitbucket url label
+    local labelName="_$name"
+    [[ $name == "$( basename "$TARGET" )" ]] && labelName=
+    if [[ -z $host ]] ; then
+        host='bitbucket.org'
+        user='git'
+        url="$user@$host:$bbName/$name.git"
+        label="bb_$bbName$labelName"
+    else
+        label="bb_${host}_$bbName$labelName"
+    fi
+
+    # Check Bitbucket username
+    CheckHttpCode "https://$host/$path" || Die "Unknown Bitbucket namespace '$path' in spec '$spec'"
+
+# TODO check NOT public user ?
+
+    # Check Github SSH connection
+       CheckSshAuth git $host $port \
+    || Die "Failed connecting to Bitbucket: $buf"
+
+    SaveRemoteData $1
+}
+
+
+KeybaseCheck() # $1:ID
+{
+    LoadRemoteData
+
+    [[ -z "$host$user" ]] || Die "Invalid Keybase spec '$spec'"
+
+    # TODO Validate Keybase username: $path
+    #  https://github.com/keybase/keybase-issues/issues/757#issuecomment-45229307
+
+    # TODO Validate Keybase repo $name
+    
+    # TODO Validate Keybase $scope: same as $path plus dots
+    [[ -z $scope ]] && scope='private'
+    [[ $scope == 'public' ]] && Die "Invalid Keybase scope '%' in spec '$spec'"
+
+    # Keybase url label
+    local labelName="_$name"
+    [[ $name == "$( basename "$TARGET" )" ]] && labelName=
+
+    if [[ $scope != 'private' ]] ; then
+        url="keybase://team/$scope/$name"
+        label="kb_$scope$labelName"
+    else
+        url="keybase://$scope/$path/$name"
+        label="kb_$path$labelName"
+    fi
+
+    # Keybase CLI
+       which keybase &>/dev/null \
+    || Die "Missing 'keybase' binary"
+
+    SaveRemoteData $1
+}
+
+
+
+########
+# FUNC #  Plugins: *Create
+########
+
+
+SshCreate() # $1:ID
+{
+    LoadRemoteData
+
+    # Check SSH repo exists
+    local emptyDir=$( mktemp -d )
+    pushd "$emptyDir" &>/dev/null
+    git ls-remote --exit-code "$url" &>/dev/null
+    local exists=$?
+    popd &>/dev/null
+
+    # Create remote GIT repo over SSH
+    if [[ $exists -ne 0 ]] ; then
+        Log "Creating remote SSH repository '$path/$name.git'"
+
+        local sshCmd
+        IFS='' read -r -d '' sshCmd <<EOF
+if ! [ -d "$path/$name.git" ] ; then
+    mkdir -p "$path/$name.git" || exit 1
+fi
+cd "$path/$name.git" || exit 1
+if [ "\$(git rev-parse --is-inside-git-dir 2>/dev/null)" == "true" ] ; then
+    [ "\$(git rev-parse --is-bare-repository 2>/dev/null)" != "true" ]    && exit 16
+    exit 0
+else
+    git init --bare || exit 1
+fi
+EOF
+        Cmd ssh -F /dev/null -o ControlMaster=no \
+            ${SSH_IDS[@]+ -o IdentitiesOnly=yes "${SSH_IDS[@]}" } \
+            ${SOCKS_PORT+ -o ProxyCommand="socat - SOCKS4A:$SOCKS_HOST:%h:%p,socksport=$SOCKS_PORT" -o VerifyHostKeyDNS=no} \
+            -p $port $user@$host "$sshCmd"
+        case $? in
+            0)  ;;
+            16) Die "Failed creating repository, '$path/$name.git' is not a bare repository" ;;
+            # 17) Die "Failed creating repository, '$path/$name' is nested in another GIT repo" ;;
+            *)  Die "Failed creating repository '$url'" ;;
+        esac
+    fi
+
+    ConfigureRemote $1
+}
+
+
+GithubCreate() # $1:ID
+{
+    LoadRemoteData
+
+    # Github API v3 call
+    if [[ $scope == 'public' ]] && ! CheckHttpCode "https://github.com/$path/$name" ; then
+
+# TODO Check private repos !
+# TODO read -sp "Please enter password for Github user '$path': "
+
+        [[ $TOR -eq 1 ]] && Die "Creating Github repos over TOR leads to account spam-flagging, please create MANUALLY over Tor Browser"
+
+        if [[ $scope == 'private' ]] ; then
+            local ghJson="{\"name\": \"$name\", \"private\": true}"
+        else
+            local ghJson="{\"name\": \"$name\"}"
+        fi
+
+        Log "Calling Github API v3 to create repo '$path/$name'"
+           Cmd curl ${SOCKS_PORT+--proxy socks4a://$SOCKS_HOST:$SOCKS_PORT} \
+              -H 'Accept: application/vnd.github.v3+json' \
+              -u "$path" -d "$ghJson" \
+              https://api.github.com/user/repos \
+        || Die "Failed creating Github repo '$path/$name'"
+
+    fi
+
+    ConfigureRemote $1
+}
+
+
+BitbucketCreate() # $1:ID
+{
+    LoadRemoteData
+
+    # Bitbucket API 2.0 call
+    if [[ $scope == 'private' ]] ; then
+        local bbJson='{"scm": "git", "is_private": true}'
+        local bbName=$path
+    elif [[ -n $scope && $scope != 'public' ]] ; then
+        local bbJson='{"scm": "git", "is_private": true}'
+        local bbName=$scope
+    else
+        local bbJson='{"scm": "git", "is_private": false}'
+        local bbName=$path
+    fi
+    # TOCHECK default fork_policy: {"allow_forks","no_public_forks","no_forks"}
+
+    if [[ $scope == 'public' ]] && ! CheckHttpCode "https://bitbucket.org/$path/$name" ; then
+
+# TODO Check private repos !
+# TODO read -sp "Please enter password for Bitbucket user '$path'"
+
+        Log "Calling Bitbucket API to create repo '$bbName/$name'"
+
+           Cmd curl ${SOCKS_PORT+--proxy socks4a://$SOCKS_HOST:$SOCKS_PORT} \
+            -H "Content-Type: application/json" \
+            -u "$path" -d "$bbJson" \
+            "https://api.bitbucket.org/2.0/repositories/$bbName/$name" \
+        || Die "Failed creating Bitbucket repo '$bbName/$name'"
+    fi
+
+    ConfigureRemote $1
+}
+
+
+GitlabCreate() # $1:ID
+{
+    # LoadRemoteData
+
+    # TODO Setup remote $scope
+    # git@gitlab.example.com:namespace/nonexistent-project.git
+
+    # CLI project = gl.projects.create({'name': 'project1'})
+    
+    # API "{\"name\": \"$name\", \"visibility\": \"$scope\"}"ssus
+    # https://docs.gitlab.com/ee/api/projects.html#create-project
+    # https://docs.gitlab.com/ee/api/projects.html#edit-project
+    # API https://docs.gitlab.com/ce/api/README.html#personal-access-tokens
+
+
+    ConfigureRemote $1
+}
+
+
+KeybaseCreate() # $1:ID
+{
+    LoadRemoteData
+
+    # Keybase CLI: login
+    local kbStatus=$( keybase status --json )
+    local userName=$( jq -r '.Username' <<<"$kbStatus" )
+    local isLogged=$( jq -r '.LoggedIn' <<<"$kbStatus" )
+    local isValid=$(  jq -r '.SessionIsValid' <<<"$kbStatus" )
+
+    if [[ $userName != $path ]] && [[ $isLogged == 'true' ]] ; then
+        # Log "Logging out Keybase user: $userName"
+        # Cmd keybase logout || Die "Failed to logout '$userName' Keybase user"
+        Die "Already logged in Keybase as '$userName'"
+    fi
+
+    if [[ $userName != $path ]] || [[ $isLogged != 'true' ]] ; then
+        Log "Logging in Keybase user: $path"
+        Cmd keybase login $path || Die "Failed to login '$path' Keybase user"
+        PushTrap keybase logout
+    fi
+    
+    # Keybase CLI: check
+    local kbStatus=$( keybase status --json )
+    local userName=$( jq -r '.Username' <<<"$kbStatus" )
+    local isLogged=$( jq -r '.LoggedIn' <<<"$kbStatus" )
+    local isValid=$(  jq -r '.SessionIsValid' <<<"$kbStatus" )
+
+    if [[ $userName == $path ]] && [[ $isLogged == 'true' ]] && [[ $isValid == 'true' ]] ; then
+        : # OK
+    else
+        Die "Failed to login '$path' Keybase user"
+    fi
+
+    local team=
+    [[ -n $scope && $scope != 'private' ]] && team="$scope"
+
+
+    # Keybase CLI: team
+    if [[ -n $team ]] ; then
+           keybase team list-memberships \
+        |  awk -v team="$team" '(NR>1)&&($1==team){member=1} END {exit !member}' \
+        || Die "Keybase user '$path' is not member of team '$team'"
+    fi
+
+    # Keybase CLI: git
+    keybase git list | awk -v team="$team" -v repo="$name" '
+/^personal repos:/ && (length(team)==0) {s=1}
+/^team repos:/ && (length(team)) {s=2}
+(s==1) && (length(team)==0) && ($1==repo) {exists=1}
+(s==2) && (length(team)) && ($1==team"/"repo) {exists=1}
+END {exit !exists}'
+    if [[ $? -ne 0 ]] ; then
+# TOCHECK --join-subteam
+        Log "Creating Keybase repo '$name'"
+
+           Cmd keybase git create ${team+--team=$team} $name \
+        || Die "Failed creating Keybase repo '$path/$name'"
+    fi
+
+    ConfigureRemote $1
+}
+
+
+
+########
+# MAIN #
+########
+
+
+Main()
+{
+
+    ########
+    # INIT #  System
+    ########
+
+    [[ $( id -u ) == "0" ]] && Die "Cannot run as root"
+
+    for dep in keybase jq curl socat ; do
+        which $dep &>/dev/null || Die "Missing dependency: $dep"
+    done
+
+
+    ########
+    # INIT #  Defaults
+    ########
+
+    local -a REMOTES SSH_KEYS SSH_IDS
+    local TARGET CONFIG SOCKS SOCKS_PORT SOCKS_HOST TOR=0 ALIGNED=1
+
+    local BRANCH=$( git rev-parse --abbrev-ref HEAD 2>/dev/null )
+    local GIT_NAME=$( git config --get user.name )
+    local GIT_EMAIL=$( git config --get user.email )
+    local EMPTY_COMMIT_MSG="Initial commit" # $( basename "$BASH_SOURCE" )
+
+
+    ########
+    # INIT #  Args parse
+    ########
+
+    while [[ $# -gt 0 ]] ; do case "$1" in
+        --ssh|--github|--gitlab|--keybase)
+            [[ -n $2 ]] || Usage 1
+            ParseRemoteData ${1:2} "$2"
+            shift 2 ;;
+        --key)
+            [[ -n $2 ]] || Usage 1
+            SSH_KEYS+=( "$( readlink --canonicalize-missing "$2" )" )
+            shift 2 ;;
+        --tor)
+            [[ -n $2 ]] || Usage 1
+            SOCKS_PORT=$2
+            SOCKS_HOST=127.0.0.1
+            TOR=1
+            shift 2 ;;
+        --socks)
+            [[ -n $2 ]] || Usage 1
+            SOCKS=$2
+            shift 2 ;;
+        --name)
+            [[ -n $2 ]] || Usage 1
+            GIT_NAME=$2
+            shift 2 ;;
+        --email)
+            [[ -n $2 ]] || Usage 1
+            GIT_EMAIL=$2
+            shift 2 ;;
+        --debug)
+            DEBUG=1
+            shift ;;
+        --dry)
+            DRY=1
+            DEBUG=1
+            shift ;;
+        *)  break ;;
+    esac ; done
+
+    [[ $# -lt 1 ]] && Usage 1
+    TARGET=$1
+    shift
+    BRANCH=$1
+    shift
+    [[ $# -ne 0 ]] && Usage 1
+    [[ -z $TARGET ]] && Usage 1
+
+
+    ########
+    # INIT #  Args check
+    ########
+
+    [[ -z $BRANCH ]] && BRANCH=master
+
+    TARGET=$( readlink --canonicalize-missing "$TARGET" )
+    # TODO Validate $TARGET
+
+    ValidateRef "$BRANCH" || Die "Invalid branch name '$BRANCH'"
+
+    ValidateEmail "$GIT_EMAIL" || Die "Invalid EMAIL address '$GIT_EMAIL'"
+
+    if [[ $TOR -ne 0 && -n $SOCKS ]] ; then
+        Die "Use either --socks or --tor, not both !"
+    elif [[ $TOR -eq 1 ]] ; then
+        ValidateTcp "$SOCKS_PORT" || Die "Invalid TOR port '$SOCKS_PORT'"
+        CheckTor "$SOCKS_PORT" || Die "Unresponsive TOR port '$SOCKS_PORT'"
+    elif [[ -n $SOCKS ]] ; then
+        [[ $SOCKS =~ : ]] || Die "Invalid SOCKS config, should be HOST:PORT"
+        SOCKS_PORT=${SOCKS#*:}
+        SOCKS_HOST=${SOCKS%%:*}
+        [[ -n $SOCKS_HOST ]] || SOCKS_HOST=localhost
+        ValidateTcp "$SOCKS_PORT" || Die "Invalid SOCKS port '$SOCKS_PORT'"
+        CheckHttpCode "https://mozilla.org" || Die "Unresponsive SOCKS proxy '$SOCKS_HOST:$SOCKS_PORT'"
+    fi
+
+
+    ########
+    # CORE #
+    ########
+
+    CreateSshKeys "${SSH_KEYS[@]}"
+    
+    MapRemoteData Check
+
+    LocalCheck
+
+    DebugRemoteData
+
+    LocalCheck
+
+    LocalCreate
+
+    pushd "$TARGET" &>/dev/null
+
+    MapRemoteData Create
+
+    ConfigureAlias
+
+    popd &>/dev/null
+}
+
+
+
+########
+# EXEC #  Main
+########
+
+Main "$@"
+
+exit 0
