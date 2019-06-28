@@ -26,14 +26,12 @@ gitr \
 ## Pluggable backends
 
 |  BACKEND  |       CREATION       |    Supported SCOPES   | KEY | TOR |
-|===========|======================|=======================|=====|=====|
+|-----------|----------------------|-----------------------|-----|-----|
 | ssh       | `ssh git init`       | private               | yes | yes |
 | gitlab    | `git push`           | private               | yes | yes |
 | github    | API prompts password | private,public        | yes | !!! |
 | bitbucket | API prompts password | private,public,TEAMID | yes | yes |
 | keybase   | CLI may call GUI     | private,TEAMID        | no  | no  |
-
-
 
 <!-- TODO Gitlab python CLI
 | gitlab_cli | CLI requires config+token | private,public,internal | yes | yes |

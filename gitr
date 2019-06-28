@@ -44,7 +44,7 @@ Usage() # $1:RET
   - if all branches are aligned, will create a convenient 'all' remote
 
 |  BACKEND  |       CREATION       |    Supported SCOPES   | KEY | TOR |
-|===========|======================|=======================|=====|=====|
+|-----------|----------------------|-----------------------|-----|-----|
 | ssh       | `ssh git init`       | private               | yes | yes |
 | gitlab    | `git push`           | private               | yes | yes |
 | github    | API prompts password | private,public        | yes | yes |
